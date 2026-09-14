@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0e1726">
+    <title>Share Web · 局域网共享</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">LAN SHARE SPACE</p>
+        <h1>随手分享，留在局域网里。</h1>
+        <p class="subtitle">拖入文件，或直接在页面按 Ctrl+V 创建一条共享文字。</p>
+      </div>
+      <div class="usage" aria-live="polite">
+        <span class="usage-label">空间使用</span>
+        <strong id="usage-text">读取中…</strong>
+        <div class="usage-bar"><span id="usage-fill"></span></div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel files-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="panel-kicker">FILES</span>
+            <h2>共享文件</h2>
+          </div>
+          <label class="button primary upload-button">
+            选择文件
+            <input id="file-input" type="file" multiple>
+          </label>
+        </div>
+
+        <div id="drop-zone" class="drop-zone" tabindex="0">
+          <div class="drop-icon">↥</div>
+          <strong>拖拽文件到这里上传</strong>
+          <span>也可以点击右上角选择文件</span>
+        </div>
+        <div id="file-list" class="card-list" aria-live="polite"></div>
+        <div id="file-empty" class="empty-state">还没有共享文件</div>
+      </section>
+
+      <section class="panel clips-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="panel-kicker">CLIPBOARD</span>
+            <h2>文字剪切板</h2>
+          </div>
+          <span class="hint">Ctrl+V 新建</span>
+        </div>
+        <div id="clip-list" class="card-list" aria-live="polite"></div>
+        <div id="clip-empty" class="empty-state">复制或粘贴一段文字，它会出现在这里</div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
