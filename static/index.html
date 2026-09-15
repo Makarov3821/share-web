@@ -9,15 +9,30 @@
   </head>
   <body>
     <header class="topbar">
-      <div>
+      <div class="brand">
         <p class="eyebrow">LAN SHARE SPACE</p>
-        <h1>随手分享，留在局域网里。</h1>
-        <p class="subtitle">拖入文件，或直接在页面按 Ctrl+V 创建一条共享文字。</p>
       </div>
-      <div class="usage" aria-live="polite">
-        <span class="usage-label">空间使用</span>
-        <strong id="usage-text">读取中…</strong>
-        <div class="usage-bar"><span id="usage-fill"></span></div>
+      <div class="topbar-tools">
+        <div class="usage" aria-live="polite">
+          <span class="usage-glyph" aria-hidden="true">◒</span>
+          <div class="usage-copy">
+            <span class="usage-label">空间使用</span>
+            <strong id="usage-text">读取中…</strong>
+          </div>
+          <div class="usage-bar"><span id="usage-fill"></span></div>
+        </div>
+        <div class="topbar-actions">
+          <button id="help-button" class="topbar-button help-button" type="button" title="使用说明" aria-label="使用说明">?</button>
+          <label class="theme-control" title="主题设置">
+            <span class="theme-glyph" aria-hidden="true">◐</span>
+            <span class="sr-only">主题</span>
+            <select id="theme-select" aria-label="主题">
+              <option value="system">跟随系统</option>
+              <option value="dark">深色</option>
+              <option value="light">浅色</option>
+            </select>
+          </label>
+        </div>
       </div>
     </header>
 
@@ -36,7 +51,7 @@
 
         <div id="drop-zone" class="drop-zone" tabindex="0">
           <div class="drop-icon">↥</div>
-          <strong>拖拽文件到这里上传</strong>
+          <strong>拖拽文件到页面任意位置上传</strong>
           <span>也可以点击右上角选择文件</span>
         </div>
         <div id="file-list" class="card-list" aria-live="polite"></div>
@@ -49,13 +64,38 @@
             <span class="panel-kicker">CLIPBOARD</span>
             <h2>文字剪切板</h2>
           </div>
-          <span class="hint">Ctrl+V 新建</span>
+          <span class="hint">Ctrl/Command+V 新建</span>
         </div>
+        <form id="clip-form" class="clip-composer">
+          <textarea id="clip-input" rows="3" placeholder="在这里粘贴或输入文字…" enterkeyhint="done" spellcheck="true"></textarea>
+          <div class="composer-footer">
+            <span>回车保存 · Shift+Enter 换行</span>
+            <button class="button primary" type="submit">保存文字</button>
+          </div>
+        </form>
         <div id="clip-list" class="card-list" aria-live="polite"></div>
         <div id="clip-empty" class="empty-state">复制或粘贴一段文字，它会出现在这里</div>
       </section>
     </main>
 
+    <div id="drop-overlay" class="drop-overlay" hidden aria-hidden="true">
+      <div class="drop-overlay-card">
+        <div class="drop-overlay-icon" aria-hidden="true">↥</div>
+        <strong>松开即可上传</strong>
+        <span>支持同时拖入多个文件</span>
+      </div>
+    </div>
+
+    <div id="modal-root" class="modal-root" hidden>
+      <div class="modal-backdrop" data-modal-close></div>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-description">
+        <button id="modal-close" class="modal-close" type="button" title="关闭" aria-label="关闭" data-modal-close>×</button>
+        <p id="modal-kicker" class="modal-kicker"></p>
+        <h3 id="modal-title"></h3>
+        <div id="modal-description" class="modal-content"></div>
+        <div id="modal-actions" class="modal-actions"></div>
+      </section>
+    </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/app.js"></script>
   </body>

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     collections::HashSet,
     fs,
     net::SocketAddr,
@@ -10,7 +11,10 @@ use std::{
 use axum::{
     Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State, multipart::MultipartError},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Multipart, Path as AxumPath, State,
+        multipart::MultipartError,
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, patch, post},
@@ -54,14 +58,20 @@ struct Args {
     /// Interval in seconds between expired-item cleanup runs.
     #[arg(long, default_value_t = 60)]
     cleanup_interval: u64,
+
+    /// Trust the first X-Forwarded-For value when behind a known reverse proxy.
+    #[arg(long, default_value_t = false)]
+    trust_proxy: bool,
 }
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
+    preferences: Arc<Mutex<PreferenceStore>>,
     max_total_size: u64,
     max_upload_size: u64,
     max_clip_size: u64,
+    trust_proxy: bool,
 }
 
 #[derive(Debug)]
@@ -144,6 +154,85 @@ struct Store {
     objects_dir: PathBuf,
     tmp_dir: PathBuf,
     metadata: Metadata,
+}
+
+const PREFERENCES_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Preference {
+    theme: String,
+    updated_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PreferencesFile {
+    version: u32,
+    entries: HashMap<String, Preference>,
+}
+
+impl Default for PreferencesFile {
+    fn default() -> Self {
+        Self {
+            version: PREFERENCES_VERSION,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+struct PreferenceStore {
+    path: PathBuf,
+    data: PreferencesFile,
+}
+
+impl PreferenceStore {
+    fn open(data_dir: &Path) -> Result<Self, String> {
+        let path = data_dir.join("preferences.json");
+        let data: PreferencesFile = if path.exists() {
+            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("cannot parse {}: {error}", path.display()))?
+        } else {
+            let store = Self {
+                path: path.clone(),
+                data: PreferencesFile::default(),
+            };
+            store.persist()?;
+            return Ok(store);
+        };
+        if data.version != PREFERENCES_VERSION {
+            return Err(format!(
+                "unsupported preferences version {}, expected {}",
+                data.version, PREFERENCES_VERSION
+            ));
+        }
+        Ok(Self { path, data })
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(&self.data).map_err(|error| error.to_string())?;
+        let temporary = self.path.with_extension("json.tmp");
+        fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+        fs::rename(&temporary, &self.path).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.data
+            .entries
+            .get(key)
+            .map(|preference| preference.theme.as_str())
+    }
+
+    fn set(&mut self, key: String, theme: String) -> Result<(), String> {
+        self.data.entries.insert(
+            key,
+            Preference {
+                theme,
+                updated_at: now_seconds(),
+            },
+        );
+        self.persist()
+    }
 }
 
 impl Store {
@@ -364,6 +453,16 @@ struct HealthResponse {
     max_total_size: u64,
 }
 
+#[derive(Serialize)]
+struct PreferencesResponse {
+    theme: String,
+}
+
+#[derive(Deserialize)]
+struct SetPreferences {
+    theme: String,
+}
+
 #[derive(Deserialize)]
 struct CreateClip {
     text: String,
@@ -392,6 +491,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.data_dir.display()
         )
     })?;
+    let preferences = PreferenceStore::open(&args.data_dir).map_err(|error| {
+        format!(
+            "cannot open preferences in {}: {error}",
+            args.data_dir.display()
+        )
+    })?;
 
     info!(
         listen = %listen,
@@ -399,14 +504,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_total_size,
         max_upload_size,
         max_clip_size,
+        trust_proxy = args.trust_proxy,
         "starting share-web"
     );
 
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
+        preferences: Arc::new(Mutex::new(preferences)),
         max_total_size,
         max_upload_size,
         max_clip_size,
+        trust_proxy: args.trust_proxy,
     };
 
     let cleanup_state = state.clone();
@@ -437,11 +545,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/clips", post(create_clip))
         .route("/api/items/{id}", patch(update_item).delete(delete_item))
         .route("/api/health", get(health))
+        .route(
+            "/api/preferences",
+            get(get_preferences).patch(set_preferences),
+        )
         .layer(DefaultBodyLimit::disable())
         .with_state(state);
 
     let listener = TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -481,6 +597,45 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         status: "ok",
         used_bytes: store.used_bytes(),
         max_total_size: state.max_total_size,
+    }))
+}
+
+async fn get_preferences(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PreferencesResponse>, ApiError> {
+    let key = client_key(addr, &headers, state.trust_proxy);
+    let preferences = state
+        .preferences
+        .lock()
+        .map_err(|error| ApiError::internal(format!("preferences lock poisoned: {error}")))?;
+    Ok(Json(PreferencesResponse {
+        theme: preferences.get(&key).unwrap_or("system").to_string(),
+    }))
+}
+
+async fn set_preferences(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SetPreferences>,
+) -> Result<Json<PreferencesResponse>, ApiError> {
+    if !matches!(payload.theme.as_str(), "system" | "dark" | "light") {
+        return Err(ApiError::BadRequest(
+            "theme must be system, dark, or light".to_string(),
+        ));
+    }
+    let key = client_key(addr, &headers, state.trust_proxy);
+    let mut preferences = state
+        .preferences
+        .lock()
+        .map_err(|error| ApiError::internal(format!("preferences lock poisoned: {error}")))?;
+    preferences
+        .set(key, payload.theme.clone())
+        .map_err(ApiError::internal)?;
+    Ok(Json(PreferencesResponse {
+        theme: payload.theme,
     }))
 }
 
@@ -710,6 +865,22 @@ fn lock_store(state: &AppState) -> Result<std::sync::MutexGuard<'_, Store>, ApiE
         .store
         .lock()
         .map_err(|error| ApiError::internal(format!("store lock poisoned: {error}")))
+}
+
+fn client_key(addr: SocketAddr, headers: &HeaderMap, trust_proxy: bool) -> String {
+    if trust_proxy
+        && let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+        && let Some(first) = forwarded
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        return first.to_string();
+    }
+    addr.ip().to_string()
 }
 
 fn ensure_capacity(store: &Store, max_total_size: u64, incoming_size: u64) -> Result<(), ApiError> {
