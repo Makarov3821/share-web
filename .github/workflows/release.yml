@@ -1,0 +1,516 @@
+name: Release
+
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_NAME: ghcr.io/makarov3821/share-web
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+
+jobs:
+  # ============================================================
+  # 1. 检查代码、测试、检查 tag 与 Cargo.toml 版本是否一致
+  # ============================================================
+
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check tag matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CARGO_VERSION="$(
+            cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])'
+          )"
+
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+
+          echo "Cargo.toml version : $CARGO_VERSION"
+          echo "Git tag version    : $TAG_VERSION"
+
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match tag ($GITHUB_REF_NAME)"
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Check JavaScript syntax
+        run: node --check static/app.js
+
+
+  # ============================================================
+  # 2. Linux
+  #
+  # 生成：
+  #   linux-x86_64-musl
+  #   linux-aarch64-musl
+  #   linux-x86_64-gnu
+  #   linux-aarch64-gnu
+  # ============================================================
+
+  build-linux:
+    name: Linux ${{ matrix.label }}
+    needs: verify
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            label: linux-x86_64-musl
+            smoke: true
+
+          - target: aarch64-unknown-linux-musl
+            label: linux-aarch64-musl
+            smoke: false
+
+          - target: x86_64-unknown-linux-gnu
+            label: linux-x86_64-gnu
+            smoke: true
+
+          - target: aarch64-unknown-linux-gnu
+            label: linux-aarch64-gnu
+            smoke: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cross build \
+            --locked \
+            --release \
+            --target "${{ matrix.target }}"
+
+      # ARM64 binary 无法直接在 GitHub 的 x86_64 runner 上运行，
+      # 所以这里只对两个 x86_64 产物做实际运行测试。
+      - name: Smoke test
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="target/${{ matrix.target }}/release/share-web"
+
+          echo "=== Version ==="
+          "$BIN" --version
+
+          echo
+          echo "=== Start server ==="
+
+          TEST_DIR="$(mktemp -d)"
+          LOG_FILE="$TEST_DIR/share-web.log"
+
+          "$BIN" \
+            --listen 127.0.0.1:18080 \
+            --data-dir "$TEST_DIR/data" \
+            >"$LOG_FILE" 2>&1 &
+
+          PID=$!
+
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+            rm -rf "$TEST_DIR"
+          }
+
+          trap cleanup EXIT
+
+          for i in $(seq 1 20); do
+            if curl \
+              --fail \
+              --silent \
+              http://127.0.0.1:18080/api/health \
+              | grep -q '"status":"ok"'
+            then
+              echo "Smoke test passed."
+              exit 0
+            fi
+
+            sleep 0.5
+          done
+
+          echo "Server failed health check."
+          echo
+          echo "=== Server log ==="
+          cat "$LOG_FILE"
+
+          exit 1
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/package
+
+          cp \
+            "target/${{ matrix.target }}/release/share-web" \
+            dist/package/share-web
+
+          chmod +x dist/package/share-web
+
+          tar \
+            -C dist/package \
+            -czf "dist/share-web-${GITHUB_REF_NAME}-${{ matrix.label }}.tar.gz" \
+            share-web
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+
+  # ============================================================
+  # 3. Windows x86_64
+  # ============================================================
+
+  build-windows:
+    name: Windows x86_64
+    needs: verify
+    runs-on: windows-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cargo build `
+            --locked `
+            --release `
+            --target x86_64-pc-windows-msvc
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          & ".\target\x86_64-pc-windows-msvc\release\share-web.exe" --version
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path dist | Out-Null
+
+          Compress-Archive `
+            -Path "target\x86_64-pc-windows-msvc\release\share-web.exe" `
+            -DestinationPath "dist\share-web-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+
+  # ============================================================
+  # 4. macOS Universal
+  #
+  # 同时包含：
+  #   Intel x86_64
+  #   Apple Silicon aarch64
+  # ============================================================
+
+  build-macos:
+    name: macOS Universal
+    needs: verify
+    runs-on: macos-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build Intel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo build \
+            --locked \
+            --release \
+            --target x86_64-apple-darwin
+
+      - name: Build Apple Silicon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo build \
+            --locked \
+            --release \
+            --target aarch64-apple-darwin
+
+      - name: Create Universal binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/package
+
+          lipo \
+            -create \
+            target/x86_64-apple-darwin/release/share-web \
+            target/aarch64-apple-darwin/release/share-web \
+            -output dist/package/share-web
+
+          chmod +x dist/package/share-web
+
+          echo "=== Architectures ==="
+          lipo -info dist/package/share-web
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./dist/package/share-web --version
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar \
+            -C dist/package \
+            -czf "dist/share-web-${GITHUB_REF_NAME}-macos-universal.tar.gz" \
+            share-web
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-macos-universal
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+
+  # ============================================================
+  # 5. Docker
+  #
+  # 只有六个平台全部编译成功后才发布镜像，避免：
+  #
+  #   Windows build 挂了
+  #   但 v1.0.0 Docker 已经被推送
+  #
+  # 镜像包含：
+  #   linux/amd64
+  #   linux/arm64
+  # ============================================================
+
+  docker:
+    name: Docker
+    needs:
+      - build-linux
+      - build-windows
+      - build-macos
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=A portable LAN text and file sharing web service
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+
+          platforms: |
+            linux/amd64
+            linux/arm64
+
+          push: true
+
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+  # ============================================================
+  # 6. GitHub Release
+  #
+  # Docker 也成功后，才正式创建 Release
+  # ============================================================
+
+  release:
+    name: GitHub Release
+
+    needs:
+      - build-linux
+      - build-windows
+      - build-macos
+      - docker
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd dist
+
+          echo "=== Release files ==="
+          ls -lh
+
+          sha256sum share-web-* > SHA256SUMS
+
+          echo
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+
+            echo "Release $GITHUB_REF_NAME already exists."
+            echo "Replacing release assets..."
+
+            gh release upload \
+              "$GITHUB_REF_NAME" \
+              dist/* \
+              --clobber
+
+          else
+
+            echo "Creating release $GITHUB_REF_NAME..."
+
+            gh release create \
+              "$GITHUB_REF_NAME" \
+              dist/* \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
+
+          fi
